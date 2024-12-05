@@ -5,6 +5,7 @@ import os
 
 
 
+
 # TODO make a class for discharge data with arguments for datasource and date ranges
 start_date = "2016-01-01"
 end_date = "2016-12-31"
@@ -49,6 +50,7 @@ for i in range(0, len(file_list)):
 
     # combine all df
     q_data.append(df)
+
 
 q_data = pd.concat(q_data, axis=0, ignore_index=True)
 
