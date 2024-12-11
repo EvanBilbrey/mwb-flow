@@ -11,11 +11,9 @@ emissivity_water = {"value" = 0.97, "units" = 'None'}
 atmosphericP_sealevel = {"value" = 101.3, "units" = 'kPa'}
 
 [GRIDMET]
-GRIDMET_PARAMS = [
-    'pr',
-    'tmmn',
-    'tmmx',
-]
+GRIDMET_PARAMS = ['tmmn', 'tmmx']
+VOL_PARAMS = ['pr']
+
 GRIDMET_BOUNDS = [-124.787500, 25.045833, -67.037500, 49.420833]
 GRIDMET_NROWS = 585
 GRIDMET_NCOLS = 1386
@@ -23,5 +21,5 @@ GRIDMET_XRES = 0.041666666666666664
 GRIDMET_YRES = 0.04166666666666668
 
 [DLEM]
-INPUT_VARS = ['mo_precip','mo_temp', 'mo_discharge']
+INPUT_VARS = ['mo_precip','mo_temp']
 DSET_COORDS = ['location', 'lat', 'lon', 'elev', 'time']

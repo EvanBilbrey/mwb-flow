@@ -7,8 +7,8 @@ import pandas as pd
 import xarray as xr
 from shapely.geometry import Point
 from prep.utils import get_gridmet_cells
-from config import GRIDMET_PARAMS
-
+from config import GRIDMET_PARAMS, VOL_PARAMS
+import GRIDtools as gt
 
 
 
@@ -70,10 +70,9 @@ def get_gridmet_at_points(in_geom,
 
     gmt_cntrs = gmt_cells.drop_duplicates(subset='cell_id').centroid
 
-    pr = []
+    # Parameters retrieved to be averaged over watershed area here
     tmmn = []
     tmmx = []
-
 
     cdsets = {}
     print("Fetching GridMET data for unique cells...")
@@ -88,7 +87,23 @@ def get_gridmet_at_points(in_geom,
             datasets.append(ds)
         cdsets[cell] = datasets
 
-    for i in range(len(coords)):  ## left off here, need to then allocate unique cells back to geoms, average if polygon
+    # Parameters retried to be converted wot weighted volumes here
+    if len(VOL_PARAMS) > 1:
+        raise ValueError("GRIDtools.grid_area_weighted_volume() is only compatible with the precip parameter")
+
+    # volparam_list = []
+    for p in VOL_PARAMS:
+        bnds = in_geom.total_bounds
+        gmet = GridMet(variable=p, start=start, end=end,
+                       bbox=BBox(bnds[0] - 0.5, bnds[2] + 0.5, bnds[3] + 0.5, bnds[1] - 0.5))
+
+        gmet = gmet.subset_nc(return_array=True)
+        gmet_input = gmet[list(gmet.data_vars)[0]]
+        vol_xds = gt.grid_area_weighted_volume(gmet_input, in_geom, gdf_index_col)
+        # volparam_list.append(vol_xds)
+    # xr.merge(volparam_list)
+
+    for i in range(len(coords)):
         c = coords[i]
         loc = location_ids[i]
         gmtcell_ids = gmt_cells[gmt_cells[ixcol] == loc]
@@ -96,45 +111,34 @@ def get_gridmet_at_points(in_geom,
         loc_lat.append(lat)
         loc_lon.append(lon)
 
-
         if len(gmtcell_ids.index) > 1:
 
-            prm = []
             tmmnm = []
             tmmxm = []
 
             for cid in gmtcell_ids['cell_id']:
                 dset = cdsets[cid]
 
-                prm.append(dset[GRIDMET_PARAMS.index('pr')])
                 tmmnm.append(dset[GRIDMET_PARAMS.index('tmmn')])
                 tmmxm.append(dset[GRIDMET_PARAMS.index('tmmx')])
 
-
-            prm_d = pd.concat(prm)
             tmmnm_d = pd.concat(tmmnm)
             tmmxm_d = pd.concat(tmmxm)
 
-            # TODO - use appropriate spatial summary statistics in the future, not just average over the input polygon
-            #   but area weighted volume/cumulative total for precip/solar radiation (could derive from GRIDtools package)
-            pr.append(prm_d.groupby(prm_d.index).mean())
             tmmn.append(tmmnm_d.groupby(tmmnm_d.index).mean())
             tmmx.append(tmmxm_d.groupby(tmmxm_d.index).mean())
 
         else:
             dset = cdsets[gmtcell_ids['cell_id'].values[0]]
-            pr.append(dset[GRIDMET_PARAMS.index('pr')])
             tmmn.append(dset[GRIDMET_PARAMS.index('tmmn')])
             tmmx.append(dset[GRIDMET_PARAMS.index('tmmx')])
 
-    xds = xr.Dataset(
+    mean_xds = xr.Dataset(
         {
-            "precip": (['time', 'location'], pd.concat(pr, axis=1), {'standard_name': 'Precipitation',
-                                                                     'units': 'mm'}),
             "min_temp": (['time', 'location'], pd.concat(tmmn, axis=1), {'standard_name': 'Minimum Temperature',
-                                                                     'units': 'Kelvin'}),
+                                                                         'units': 'Kelvin'}),
             "max_temp": (['time', 'location'], pd.concat(tmmx, axis=1), {'standard_name': 'Maximum Temperature',
-                                                                     'units': 'Kelvin'})
+                                                                         'units': 'Kelvin'})
         },
         coords={
             "lat": (['location'], loc_lat, {'standard_name': 'latitude',
@@ -146,15 +150,15 @@ def get_gridmet_at_points(in_geom,
                                             'units': 'degrees',
                                             'crs': '4326'}),
             "elev": (['location'], loc_elev, {'standard_name': 'elevation',
-                                            'long_name': 'location_elevation',
-                                            'units': 'meters'}),
+                                              'long_name': 'location_elevation',
+                                              'units': 'meters'}),
             "location": (['location'], location_ids, {'long_name': 'location_identifier',
-                                            'cf_role': 'timeseries_id'}),
-            "time": pr[0].index
+                                                      'cf_role': 'timeseries_id'}),
+            "time": tmmn[0].index
         },
         attrs={
             "featureType": 'timeSeries',
         }
     )
 
-    return xds
+    return xr.merge([mean_xds, vol_xds])
