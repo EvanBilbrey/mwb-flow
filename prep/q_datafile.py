@@ -7,8 +7,8 @@ import os
 
 
 # TODO make a class for discharge data with arguments for datasource and date ranges
-start_date = "2016-01-01"
-end_date = "2016-12-31"
+start_date = "2016-08-01"
+end_date = "2016-11-30"
 dir = r'C:\Users\CND905\Downloaded_Programs\mwb_flow\Examples\data\discharge _copy'
 
 # create lists of file names and Id labels
@@ -47,6 +47,7 @@ for i in range(0, len(file_list)):
     # add a column for gage Id that matches the file name
     location = [str(label_list[i])] * len(df)
     df["location"] = location
+    df["location"] = df["location"].astype(int)
 
     # combine all df
     q_data.append(df)
@@ -63,6 +64,7 @@ print(q_data)
 
 # Save as .nc file until above code can be used as class to make object
 q_data.to_netcdf('q_datafile_output.nc')
+
 
 
 

@@ -1,7 +1,8 @@
 from pathlib import Path
 import tomli
 
-path = Path('./config') / 'pydlem_settings.toml'
+# path = Path('./config') / 'pydlem_settings.toml'
+path = Path(__file__).parent / 'pydlem_settings.toml'
 with path.open(mode='rb') as f:
     settings = tomli.load(f)
 
@@ -16,7 +17,6 @@ absolute_zero = settings['CONSTANTS']['absolute_zero']
 water_density = settings['CONSTANTS']['water_density']
 timestep = settings['CONSTANTS']['timestep']
 GRIDMET_PARAMS = settings['GRIDMET']['GRIDMET_PARAMS']
-VOL_PARAMS = settings['GRIDMET']['VOL_PARAMS']
 GRIDMET_BOUNDS = settings['GRIDMET']['GRIDMET_BOUNDS']
 GRIDMET_NROWS = settings['GRIDMET']['GRIDMET_NROWS']
 GRIDMET_NCOLS = settings['GRIDMET']['GRIDMET_NCOLS']

@@ -17,10 +17,11 @@ import xarray as xr
 from tqdm import tqdm
 
 
+
 #TODO edit code to accept xarray.datasets instead of a dictionary
 class WB_Model():
     
-    def __init__(self, data_dict, soil_stor_cap, latitude, init_per, Temp_sno=0,  
+    def __init__(self, data_dict, soil_stor_cap, init_per, Temp_sno=0,
                  Temp_rain=5, dr_frac=0.06, mlt_rate=0.6, rfactor=0.5):
         self.STC = soil_stor_cap
         self.snotemp = Temp_sno
@@ -28,7 +29,7 @@ class WB_Model():
         self.DRF = dr_frac
         self.alpha = mlt_rate
         self.rfactor = rfactor
-        self.latitude = latitude
+        self.latitude = data_dict.coords["lat"].values[0]
         self.init_per = init_per
         self.STo = 0.0
         self.snw_st_init = 0.0
@@ -41,11 +42,13 @@ class WB_Model():
         self.alpha_rng = [0.01, 0.99]
         self.rfactor_rng = [0.01, 0.99]
         # TODO edit code to accept xarray.datasets instead of a dictionary
-        self.T = data_dict['temp'] - 273.15  ## Convert to Celcius
-        self.P = data_dict['precip']
-        self.dates = data_dict['dates']
-        self.monthly_Q = data_dict['mon_Q']
-        self.days_in_mnth = self.dates.days_in_month
+        # Updated latitude, T, P, dates, monthly_Q, days_in_mnth
+        # data_dict inputs are indexed to the first columns of arrays
+        self.T = data_dict.mo_precip.values[:,0]
+        self.P = data_dict.mo_precip.values[:,0]
+        self.dates = pd.to_datetime(data_dict.coords["time"].values)
+        self.monthly_Q = pd.Series(data_dict.mo_discharge.values[:,0], index=data_dict.coords["time"].values)
+        self.days_in_mnth = pd.to_datetime(data_dict.coords["time"].values).daysinmonth
        
         # gridded data for WB variables
         self.snowfall = None
@@ -94,7 +97,7 @@ class WB_Model():
         
     def _snowmelt(self, alpha, Tsnow):
         ## Snowmelt
-        Sno_M = alpha * (self.T - Tsnow) * self.days_in_mnth.values[:,None,None]      # Water Balance Runoff Variable
+        Sno_M = alpha * (self.T - Tsnow) * self.days_in_mnth[:,None,None]      # Water Balance Runoff Variable
         Sno_M[Sno_M < 0.0] = 0.0
         return Sno_M
 
@@ -106,7 +109,7 @@ class WB_Model():
         rho_sat = 216.7 * (e_sat / (self.T + 273.3))
         D = self._day_length()
         Kpec = 1.0
-        PET = 0.1651 * self.days_in_mnth.values[:,None, None] * (D[:,None,None]/12) * rho_sat * Kpec
+        PET = 0.1651 * self.days_in_mnth[:,None, None] * (D[:,None,None]/12) * rho_sat * Kpec
         return PET
 
     def _soilmoisture_storage(self, dates, time_offset, Tsnow, Train, drf, alpha, rfactor):
@@ -299,7 +302,6 @@ class WB_Model():
         
         params = list(zip(sno_t, rain_t, drf, alpha, rfac))
         
-        NaSut = []
         NaSut = []
         for param in params:
             Result = self.run_model(Tsnow=param[0], 
