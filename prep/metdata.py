@@ -196,7 +196,7 @@ def get_gridmet_for_polygons_with_xvec(in_geom,
     ds = xr.merge(gmet_list)
     ds = ds.xvec.zonal_stats(geometry=in_geom.geometry, x_coords="lon", y_coords="lat", stats="mean", method="iterate")
 
-    loc_df = pd.DataFrame(in_geom.gageID).set_index(in_geom.geometry)
+    loc_df = pd.DataFrame(in_geom[gdf_index_col]).set_index(in_geom.geometry)
     loc_df = loc_df.reindex(in_geom.geometry.values)
 
     lat_df = pd.DataFrame((in_geom.geometry.bounds['miny'] + in_geom.geometry.bounds['maxy']) / 2).set_index(
@@ -233,6 +233,7 @@ def get_gridmet_for_polygons_with_xvec(in_geom,
 
     return output
 
+# TODO update get_gridmet_for_polygons to follow pydlem update
 def get_gridmet_for_polygons(in_geom,
                           gdf_index_col,
                           start = DEFAULT_DATES[0],
@@ -259,22 +260,24 @@ def get_gridmet_for_polygons(in_geom,
         gmet_input = gmet[list(gmet.data_vars)[0]]
 
         if p == 'pr':
+            gmet_input = gmet_input / 1000  # convert from mm to meters
             vol_xds = gt.grid_area_weighted_volume(gmet_input, in_geom, gdf_index_col)
-            vol_xds = vol_xds.drop('area')
+            # vol_xds = vol_xds.drop('area')
         else:
             # This is done for each output of the above code
-            in_geom["gageID"] = in_geom.gageID.astype(int)
-            gmet_input = gmet_input.rio.write_crs(input_crs=crs).rio.clip(in_geom.geometry.values, in_geom.crs)
+            in_geom[gdf_index_col] = in_geom[gdf_index_col].astype(int)
+            gmet_input = gmet_input.rio.write_crs(input_crs=crs).rio.clip(
+                in_geom.geometry.values, in_geom.crs, all_touched=True)
             gmet_input.name = p
 
-            grid_out = make_geocube(vector_data=in_geom, measurements=["gageID"], like=gmet_input).set_coords('gageID')
+            grid_out = make_geocube(vector_data=in_geom, measurements=[gdf_index_col], like=gmet_input).set_coords(gdf_index_col)
 
             for date in range(0, len(gmet_input.time.values)):
                 gmet_ts = gmet_input[date, :, :]
                 grid_ts = grid_out
 
                 grid_ts[p] = (grid_out.dims, gmet_ts.values, gmet_ts.attrs, gmet_ts.encoding)
-                grid_ts = grid_out.drop("spatial_ref").groupby(grid_out.gageID).mean()
+                grid_ts = grid_out.drop("spatial_ref").groupby(grid_out[gdf_index_col]).mean()
 
                 xda = grid_ts[p]
                 xda = xda.expand_dims({"time": 1}).assign_coords(time=('time', [gmet_ts.time.values]))
@@ -282,7 +285,7 @@ def get_gridmet_for_polygons(in_geom,
         xds = xr.merge(var_list)
 
     lat_df = pd.DataFrame((in_geom.geometry.bounds['miny'] + in_geom.geometry.bounds['maxy']) / 2).set_index(
-        in_geom.gageID)
+        in_geom[gdf_index_col])
     lat_df = lat_df.reindex(list(xds.gageID.values.astype(int)))
 
     xds = xr.Dataset(
@@ -297,7 +300,7 @@ def get_gridmet_for_polygons(in_geom,
                                                             'long_name': 'location_latitude',
                                                             'units': 'degrees',
                                                             'crs': '4326'}),
-            "location": (['location'], xds['gageID'].values.astype(int), {'long_name': 'location_identifier',
+            "location": (['location'], xds[gdf_index_col].values.astype(int), {'long_name': 'location_identifier',
                                                                           'cf_role': 'timeseries_id'}),
             # Keep the order of xds
             "time": xds['time'].values
