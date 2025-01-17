@@ -2,70 +2,185 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import os
-import datetime
+from datetime import datetime, timedelta
+# USGS imports
+import os
+import json
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import dataretrieval.nwis as nwis
+
+# Pull data from stage gages - Units are CFS
+DEFAULT_DATES = ('1979-01-01', (datetime.today() - timedelta(days=2)).strftime("%Y-%m-%d"))
 
 
+class Get_Flow_Data():
+
+    def __init__(self, start=DEFAULT_DATES[0], end=DEFAULT_DATES[1], source=None, directory=None, site_number=None,
+                 data_frequency='iv', parameter_code='00060', summarize_frequency='daily', units='cfs'):
+
+        self.start = start
+        self.end = end
+
+        if source in ['stage_file', 'get_usgs']:
+            self.source = source
+            if source == 'stage_file' and directory is None:
+                raise ValueError("directory must be defined when source='stage_file'.")
+            elif source == 'get_usgs' and site_number is None:
+                raise ValueError("site_number must be defined when source='get_usgs'.")
+        else:
+            raise ValueError(f"source='{source}' input not compatible, select from: ['stage_file', 'get_usgs']")
+        self.dir = directory
+        self.sid = site_number.to_list()
+
+        if data_frequency == 'iv' and parameter_code == '00060':
+            self.data_freq = data_frequency
+            self.paramcd = parameter_code
+        else:
+            raise ValueError("class is only compatible with frequency='iv' and parameter_code='00060' arguments")
+
+        if summarize_frequency == 'daily':
+            self.summ_freq = summarize_frequency
+        else:
+            raise ValueError("summarize_frequency='daily' input is the only option")
+        self.units = units
+
+        self.imported_dataframe = None
+
+    def _get_stage_csv(self):
+        file_list = []
+        label_list = []
+        for file in os.listdir(self.dir):
+            if ".csv" in file:
+                file_list.append(file)
+                # TODO write code to slice the full gage number from files
+                label_list.append(file[0:10])
+        q_data = []
+        for i in range(0, len(file_list)):
+            df = pd.read_csv(os.path.join(self.dir, file_list[i]), skiprows=1, usecols=[0, 1])
+            df.rename(columns={list(df)[0]: "time", list(df)[1]: "q"}, inplace=True)
+
+            # add a column for gage number that matches the file name
+            sid = [str(label_list[i])] * len(df)
+            df["siteID"] = sid
+            df["siteID"] = df["siteID"].astype(str)
+
+            # combine all df
+            q_data.append(df)
+        dataframe = pd.concat(q_data, axis=0, ignore_index=True)
+
+        return pd.DataFrame(dataframe)
+
+    def _get_usgs_flows(self):
+        site_list = self.sid
+        q_data = []
+        for site in range(len(site_list)):
+            print(f'getting site {site_list[site]}, {self.start} - {self.end}...')
+            gage_df = nwis.get_record(sites=site_list[site], service=self.data_freq,
+                                 start=self.start, end=self.end, parameterCd=self.paramcd)
+            gage_df.index = pd.DatetimeIndex([pd.to_datetime(i, utc=True) for i in gage_df.index])
+
+            if gage_df.empty:
+                print(site_list[site], self.start, self.end, ' is empty')
+                return None
+
+            freq_map = {'dv': '00060_Mean', 'iv': '00060'}
+            q_col = freq_map[self.data_freq]
+            gage_df = gage_df.rename(columns={q_col: 'q'})
+
+            gage_df['q'] = np.where(gage_df['q'] < 0, np.zeros_like(gage_df['q']) * np.nan, gage_df['q'])
+            gage_df = gage_df[['q']]
+
+            gage_df = gage_df.reset_index()
+            gage_df = gage_df.rename(columns={'index': 'time'})
+            gage_df["siteID"] = [site_list[site]] * len(gage_df)
+            gage_df["siteID"] = gage_df["siteID"].astype(str)
+
+            # combine all df
+            q_data.append(gage_df)
+        df = pd.concat(q_data, axis=0, ignore_index=True)
+
+        return pd.DataFrame(df)
 
 
-# TODO make a class for discharge data with arguments for datasource and date ranges
-start_date = "2016-01-01"
-end_date = "2019-12-31"
-dir = r'C:\Users\CND905\Downloaded_Programs\mwb_flow\Examples\data\discharge _copy'
+        # print(f'getting site {self.sid}, {self.start} - {self.end}...')
+        # df = nwis.get_record(sites=self.sid, service=self.data_freq,
+        #                      start=self.start, end=self.end, parameterCd=self.paramcd)
+        # df.index = pd.DatetimeIndex([pd.to_datetime(i, utc=True) for i in df.index])
+        #
+        # if df.empty:
+        #     print(self.sid, self.start, self.end, ' is empty')
+        #     return None
+        #
+        # freq_map = {'dv': '00060_Mean', 'iv': '00060'}
+        # q_col = freq_map[self.data_freq]
+        # df = df.rename(columns={q_col: 'q'})
+        #
+        # df['q'] = np.where(df['q'] < 0, np.zeros_like(df['q']) * np.nan, df['q'])
+        # df = df[['q']]
+        #
+        # df = df.reset_index()
+        # df = df.rename(columns={'index': 'time'})
+        # df["siteID"] = [self.sid] * len(df)
+        # df["siteID"] = df["siteID"].astype(str)
+        #
+        # return pd.DataFrame(df)
 
-# create lists of file names and Id labels
-file_list = []
-label_list = []
-for file in os.listdir(dir):
-    if ".csv" in file:
-        file_list.append(file)
-        # TODO write code to slice the full gage number from files
-        label_list.append(file[6:10])
+    def _format_flow(self):
 
-# open files by looping through file_list then formatting into monthly discharge by location
-q_data = []
-for i in range(0, len(file_list)):
-    print(i)
-    df = pd.read_csv(os.path.join(dir, file_list[i]), skiprows=1, usecols=[0, 1])
+        # resample discharge my daily_mean or instantaneous_sum. Returns pd.dataframe with q as ft^3
+        combine_list = []
+        id_list = self.imported_dataframe['siteID'].unique().tolist()
+        if self.summ_freq == 'daily':
+            for site in range(len(id_list)):
+                gage_df = pd.DataFrame(self.imported_dataframe.loc[self.imported_dataframe['siteID'] == id_list[site]])
+                gage_df.time = pd.to_datetime(gage_df.time)
+                gage_df = gage_df.reset_index().set_index("time").drop(['siteID', 'index'], axis=1)
+                gage_df = gage_df.resample('D').mean()
+                gage_df['siteID'] = [id_list[site]] * len(gage_df)
+                combine_list.append(gage_df)
+            df = pd.concat(combine_list, axis=0, ignore_index=False)
+            df['q'] = df['q'] * 86400
 
-    # make column headers uniform for all gages
-    df.rename(columns={list(df)[0]: "time", list(df)[1]: "q"}, inplace=True)
+        elif self.summ_freq == "instant":
+            for site in range(len(id_list)):
+                gage_df = (pd.DataFrame(self.imported_dataframe.loc[self.imported_dataframe['siteID'] == id_list[site]])
+                           .reset_index())
+                gage_df.time = pd.to_datetime(gage_df.time)
+                tdelt = [(gage_df["time"][i + 1] - gage_df["time"][i]).seconds for i in range(len(gage_df["time"]) - 1)]
+                tdelt.append(tdelt[-1])
+                gage_df['q'] = gage_df['q'] * tdelt
+                combine_list.append(gage_df)
+            df = pd.concat(combine_list, axis=0, ignore_index=False)
+            df = df.set_index("time").drop(['index'], axis=1)
 
-    # Calculate seconds between consecutive timestamps
-    df["time"] = df["time"].astype("datetime64[ns]")
-    tdelt = [(df["time"][i+1] - df["time"][i]).seconds for i in range(len(df["time"]) - 1)]
-    tdelt.append(tdelt[-1])
+        else:
+            raise ValueError(f"frequency='{self.summ_freq}' is not yet available.")
 
-    # Calculate monthly volume
-    df["q"] = df["q"] / 35.3146667 # convert ft^3/s to m^3/s
-    df['q_vol'] = df['q'] * tdelt
-    df = df.resample('MS', on="time").sum()
-    df = df.drop('q', axis=1)
-    df = df.reset_index()
-# TODO write code to flag months without full discharge records
-    # Add Start and Stop dates for each dataset
-    mask = (df["time"] >= start_date) & (df["time"] <= end_date)
-    df = df.loc[mask]
+        # Convert from ft^3 to m^3
+        if self.units == 'cfs':
+            df["q"] = round(df["q"] / 35.3146667, 2)
+        else:
+            raise ValueError(
+                f"units='{self.units}' are not compatible with function. Convert input data to ft^3/s first.")
 
-    # add a column for gage Id that matches the file name
-    location = [str(label_list[i])] * len(df)
-    df["location"] = location
-    df["location"] = df["location"].astype(int)
+        # make dataframe into xarray.Dataset
+        df = pd.DataFrame(df)
+        df = df.rename(columns={"siteID": 'location', 'q': "discharge_volume"})
+        df = df.reset_index().set_index(["location", "time"]).to_xarray()
+        df['time'] = pd.DatetimeIndex(df['time'].values)
 
-    # combine all df
-    q_data.append(df)
-q_data = pd.concat(q_data, axis=0, ignore_index=True)
+        return df
 
-# convert to a xarray DataArray
-q_data = q_data.set_index(["time", "location"])
-q_data = q_data.to_xarray()
-q_data = xr.DataArray(q_data.q_vol, attrs={'standard_name': 'Monthly Discharge Volume', 'units': 'm^3'})
-q_data.name = "mo_discharge_vol"
-print(q_data)
+    def create_dataframe(self):
+        if self.source == 'stage_file':
+            imported_df = self._get_stage_csv()
+        elif self.source == 'get_usgs':
+            imported_df = self._get_usgs_flows()
+        self.imported_dataframe = imported_df
 
-# Save as .nc file until above code can be used as class to make object
-q_data.to_netcdf('q_datafile_output.nc')
+        output = self._format_flow()
 
-
-
-
+        return output
 
