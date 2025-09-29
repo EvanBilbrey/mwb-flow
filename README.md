@@ -11,3 +11,5 @@ conda install -c conda-forge py3dep
 conda install ipykernel tqdm tomli
 pip install pynhd
 pip install matplotlib
+
+pip install spotpy
