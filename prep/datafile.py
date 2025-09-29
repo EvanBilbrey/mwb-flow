@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import geopandas as gpd
 import xarray as xr
 from typing import Union
@@ -9,154 +10,57 @@ from config import DSET_COORDS
 from prep.metdata import get_gridmet_at_points
 
 
-MET_SOURCES = [
-    'gridmet',
-    'daymet',
-    'from_file'
-]
-
-
 class CreateInputFile:
     """
-
-    Prepares/provides methods to prepare a xarray Dataset for use in the mwb_flow model based on input sites/locations
-    where the model will estimate streamflow (e.g., watershed polygon layer in the form of a geopandas GeoDataFrame).
-    mwb_flow required inputs are meterology and streamflow at monthly frequencies.
-    These datasets are required as input to format the datafile.
-
-    :param geoms: geopandas.GeoDataFrame - geometries for which to compute evaporation estimates (point or polygon)
-    :param index_col: str or None(default) - defines the column name in geoms that will be used as the unique identifier for
-        each geometry location. None defaults to the GeoDataFrame index.
-    :param met_data: xarray.Dataset or None (default) - if Dataset is provided it is used to construct the input
-        datafile from file. If None, met_source must be provided to build initial input datafile.
-    :param met_source: str - from accepted sources ['gridmet', 'daymet', 'from_file']
-    :return: A formatted datafile class that contains necessary info to save a properly formatted mwb_flow input netcdf.
+    class for formatting input data for model.WaterBalanceModel()
+    :param m_data: xr.Dataset - dataset returned from metdata.get_gridmet_for_polygons()
+    :param q_data: xr.Dataset - daily discharge in cfs in 'discharge' titled DataArray
     """
 
-    def __init__(
-            self,
-            geoms: Union[gpd.GeoDataFrame, None],
-            index_col: Union[str, None] = None,
-            met_data: Union[xr.Dataset, None] = None,
-            met_source = 'gridmet'):
+    def __init__(self, m_data=None, q_data=None):
+        self.m_data = m_data
+        self.q_data = q_data
 
-        self.data = self._create_metinputs(geoms, index_col, met_data, met_source)
+        self.data = xr.merge([self.m_data, self.q_data])
+        self.input_file = self.format_data()
 
-    def _create_metinputs(self,
-                          geoms: gpd.GeoDataFrame,
-                          index_col: Union[str, None],
-                          met_data: Union[xr.Dataset, None] = None,
-                          met_source: str = 'gridmet') -> xr.Dataset:
-        """
-        Functin to format a .netcdf meteorology file for input into mwb_flow.
-        __________________
-
-        Valid met_source = ['gridmet', 'daymet', 'from_file']
-
-        :param geoms: geopandas.GeoDataFrame - geometries where meteorology data will be extracted.
-        :param met_data: xarray.Dataset or None(default) - Pre-formatted as discrete sampling locations netcdf with dims
-            (time, location) for each variable. Must also contain coordinate
-            vars ["lat", "lon", "elev", "location", "time"].
-        :param met_source: str - a string representing the source of meteorology data to use include
-        :return: xarray.DataSet with meteorology variables necessary for Penman Equation calculations at each geometry
-            location in geoms.
-        """
-
-        if met_source == 'from_file':
-            if met_data is None:
-                raise ValueError("met_data was not defined.")
-            else:
-                metinputs = met_data
-
-        elif met_source == 'gridmet':
-            # This is where the addition of start, end dates could be added to provide an alternative to the default
-            #   behavior of the met_source = 'gridmet' of downloading the entire GridMET POR.
-            metinputs = get_gridmet_at_points(geoms, index_col)
-
-        elif met_source == 'daymet':
-            print("Sorry, daymet is not yet available. Defaulting to gridment source.")
-            metinputs = get_gridmet_at_points(geoms, index_col)
-
+    def _check_format(self):
+        vars = [x for x in INPUT_VARS if x not in list(self.input_file.data_vars)]
+        coords = [x for x in DSET_COORDS if x not in list(self.input_file.coords)]
+        if len(vars) != 0:
+            warnings.warn("There are missing or mislabeled variables in the dataset. See the following:")
+            print("MISSING VARIABLES", *vars, sep='\n')
         else:
-            raise ValueError("Meteorology source is invalid. Valid entries:{0}".format(MET_SOURCES))
+            print("All necessary variables exist and are labeled properly.")
 
-        return metinputs
-
-    def add_variable(self, data, variable_name, var_attrs=None):
-        """
-        Function to add a variable to an existing input dataset. Only accepts one variable at a time.
-        :param data: pd.Series, pd.DataFrame, xr.DataArray, xr.Dataset - pandas objects must be formatted with
-        multiindex levels = [time, location] where location index matches those of the class.data object's location ids.
-        Time must be datetime64[ns]. Can also be xarray object formatted identical to the class.data object.
-        :param variable_name: str - name to assign to new variable from available variables
-            ['precip', 'mo_precip', 'min_temp', 'max_temp', 'mean_temp', 'mo_temp', 'mo_discharge']
-        :param var_attrs: dict or None(default) - dictionary of attributes and associated values for the new variable
-        (usually at minimum includes 'standard_name' and 'units')
-        :return: None - updates class data object with new variable
-        """
-        accepted_vars = ['precip', 'mo_precip', 'min_temp', 'max_temp', 'mean_temp', 'mo_temp', 'mo_discharge']
-        if variable_name not in accepted_vars:
-            raise ValueError("Variable name not compatible, select from: "
-                             "['precip', 'mo_precip', 'min_temp', 'max_temp', 'mean_temp', 'mo_temp', 'mo_discharge']")
-
-        if isinstance(data, pd.DataFrame):
-            data.index.names = ['time', 'location']
-            if len(data.columns) > 1:
-                print("Too many columns in dataframe, due to ambiguity, no variable was loaded.")
-            else:
-                print("Variable {0} loaded.".format(data.columns[0]))
-                var_nam = data.columns[0]
-                if var_nam != variable_name:
-                    data.columns = [variable_name]
-                    print("Variable {0} renamed to {1}".format(var_nam, variable_name))
-                else:
-                    print("Variable {0} did not need renaming.".format(var_nam))
-
-                new_ds = xr.merge([self.data, data.to_xarray()])
-                new_ds[variable_name].attrs = var_attrs
-                self.data = new_ds
-                print("New variable added.")
-        elif isinstance(data, pd.Series):
-            data.index.names = ['time', 'location']
-            data = pd.DataFrame(data, columns=[variable_name])
-            print("Series loaded and converted to DataFrame with {0} variable.".format(variable_name))
-            new_ds = xr.merge([self.data, data.to_xarray()])
-            new_ds[variable_name].attrs = var_attrs
-            self.data = new_ds
-            print("New variable added.")
-        elif isinstance(data, xr.Dataset) or isinstance(data, xr.DataArray):
-            data.name = variable_name
-            new_ds = xr.merge([self.data, data])
-            if var_attrs is None:
-                self.data = new_ds
-                print("New variable added.")
-            else:
-                new_ds[variable_name].attrs = var_attrs
-                self.data = new_ds
-                print("New variable added.")
+        if len(coords) != 0:
+            warnings.warn("There are missing or mislabeled coordinates in the dataset. See the following:")
+            print("MISSING COORDINATES", *coords, sep='\n')
         else:
-            print("Data type is neither pandas Series or Dataframe, no variable loaded.")
+            print("All necessary coordinates exist and are labeled properly")
 
-    def save_datafile(self, pthname):
-        self.data.to_netcdf(pthname)
+    def _format_data(self):
 
+        temp = ((self.data['min_temp'] + self.data['max_temp']) / 2) - 273.15
+        mo_temp = temp.resample(time="MS").mean()
+        mo_temp.name = 'mo_temp'
+        mo_temp = mo_temp.assign_attrs(standard_name='Monthly Temperature', units='Celsius')
 
-def check_format(xrdset):
-    vars = [x for x in INPUT_VARS if x not in list(xrdset.data_vars)]
-    coords = [x for x in DSET_COORDS if x not in list(xrdset.coords)]
-    if len(vars) != 0:
-        warnings.warn("There are missing or mislabeled variables in the dataset. See the following:")
-        print("MISSING VARIABLES", *vars, sep='\n')
-    else:
-        print("All necessary variables exist and are labeled properly.")
+        area_m2 = self.data['area'].values * 1000000  # convert polygon areas from km^2 to m^2
+        precip = (self.data['precip_volume'] / np.tile(area_m2, (
+            len(self.data['time']), 1))) * 1000  # convert precip volume (m^3) to length (m) and then to mm
+        mo_precip = precip.resample(time="MS").sum()
+        mo_precip.name = 'mo_precip'
+        mo_precip = mo_precip.assign_attrs(standard_name='Monthly Precipitation', units='mm')
 
-    if len(coords) != 0:
-        warnings.warn("There are missing or mislabeled coordinates in the dataset. See the following:")
-        print("MISSING COORDINATES", *coords, sep='\n')
-    else:
-        print("All necessary coordinates exist and are labeled properly")
+        dischg = np.round(self.data['discharge'] / 35.3146667,
+                          decimals=2) * 86400  # convert mean ft^3/second to m^3/second and then to m^3/day
+        dischg = (dischg / np.tile(area_m2, (
+            len(dischg['time']), 1))) * 1000  # convert precip volume (m^3) to length (m) and then to mm
+        mo_dischg = dischg.resample(time="MS").sum()
+        mo_dischg.name = 'mo_dischg'
+        mo_dischg = mo_dischg.assign_attrs(standard_name='Monthly Discharge', units='mm')
 
-# Default behavior create input datafile from gridmet given static reservoir variables and gridmet POR
-if __name__ == '__main__':
+        output = xr.merge([mo_temp, mo_precip, mo_dischg])
 
-    pass
+        return output
