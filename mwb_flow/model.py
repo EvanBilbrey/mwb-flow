@@ -5,11 +5,9 @@ Created on Thu Jun  4 12:09:21 2020
 DNRC Monthly Runoff Model
 @author: Todd Blythe - Hydrologist
 """
-# TODO Need to double check all math and results for correctness
+
 # TODO Update/add documentation
 ######## Gray and McCabe WaterBalance Model ########
-### Version 1.0 ###
-### Lolo Creek Specific ###
 
 ### Packages ###
 import pandas as pd
@@ -18,254 +16,275 @@ import xarray as xr
 from tqdm import tqdm
 
 
-class WB_Model():
-    # TODO change __init__ parameters to accept array of parameter values for each location
-    def __init__(self, data_arr, init_per=12, soil_stor_cap=75, temp_sno=0,
-                 temp_rain=5, dr_frac=0.06, mlt_rate=0.6, sr_factor=0.5):
-        self.STC = np.repeat(soil_stor_cap, len(data_arr.coords["location"].values))
-        self.snotemp = np.repeat(temp_sno, len(data_arr.coords["location"].values))
-        self.raintemp = np.repeat(temp_rain, len(data_arr.coords["location"].values))
-        self.DRF = np.repeat(dr_frac, len(data_arr.coords["location"].values))
-        self.melt_coef = np.repeat(mlt_rate, len(data_arr.coords["location"].values))
-        self.SRF = np.repeat(sr_factor, len(data_arr.coords["location"].values))
-        self.latitude = data_arr.coords["lat"].values
-        self.init_per = init_per
-        self.STo = np.repeat(0, len(data_arr.coords["location"].values))
-        self.snw_st_init = np.repeat(0, len(data_arr.coords["location"].values))
-        self.Sur_init = np.repeat(0, len(data_arr.coords["location"].values))
-        
-        # Calibration Parameter Ranges
-        self.snotemp_rng = [-10, 0]
-        self.raintemp_rng = [0, 10]
-        self.DRF_rng = [0.01, 0.99]
-        self.melt_coef_rng = [0.01, 0.99]
-        self.SRF_rng = [0.01, 0.99]
-        self.T = data_arr.mo_temp.values
-        self.P = data_arr.mo_precip.values
-        self.val_Q = data_arr.mo_discharge.values
-        self.locations = data_arr['location'].values
-        self.times = pd.to_datetime(data_arr.coords["time"].values)
-        self.days_in_mnth = pd.to_datetime(data_arr.coords["time"].values).daysinmonth.to_numpy()
+class WaterBalanceModel:
+    """
+    monthly water balance model
+    :param data: xr.Dataset - model input file returned from datafile.CreateInputFile()
+    :param init_steps: int - number of time steps used in model warm up
+    :param soil_storage_cap: float - soil storage capacity in mm
+    :param snow_temp: float - air temperature in degrees Celsius in which snowfall occurs below
+    :param rain_temp: float - air temperature in degrees Celsius in which rainfall occurs above
+    :param direct_runoff_frac: float - decimal fraction of rainfall that becomes direct runoff
+    :param melt_rate: float - melt rate coefficient as a decimal fraction
+    :param surplus_runoff_fac: float - decimal fraction of surplus storage that becomes surplus runoff
+    """
 
+    # TODO change __init__ parameters to accept array of parameter values for each location
+    def __init__(self, data, init_steps=12, soil_storage_cap=75, snow_temp=0, rain_temp=5, direct_runoff_frac=0.06,
+                 melt_rate=0.6, surplus_runoff_fac=0.5):
+        # initialization arguments
+        self.init_steps = init_steps
+        self.soilstoragecap = np.repeat(soil_storage_cap, len(data.coords["location"].values))
+        self.snowtemp = np.repeat(snow_temp, len(data.coords["location"].values))
+        self.raintemp = np.repeat(rain_temp, len(data.coords["location"].values))
+        self.directrunofffrac = np.repeat(direct_runoff_frac, len(data.coords["location"].values))
+        self.meltrate = np.repeat(melt_rate, len(data.coords["location"].values))
+        self.surplusrunofffact = np.repeat(surplus_runoff_fac, len(data.coords["location"].values))
+        # data inputs
+        self.latitude = data.coords["lat"].values
+        self.locations = data['location'].values
+        self.times = pd.to_datetime(data.coords["time"].values)
+        self.days_in_mnth = pd.to_datetime(data.coords["time"].values).daysinmonth.to_numpy()
+        self.t = data.mo_temp.values
+        self.p = data.mo_precip.values
+        self.q = data.mo_dischg.values
+        # soil snow and surplus t0 values
+        self.soil_st_init = np.repeat(0, len(data.coords["location"].values))
+        self.snow_st_init = np.repeat(0, len(data.coords["location"].values))
+        self.surp_st_init = np.repeat(0, len(data.coords["location"].values))
+        # calibration parameter ranges
+        self.soilstoragecap_rng = None
+        self.snowtemp_rng = [-10, 0]
+        self.raintemp_rng = [0, 10]
+        self.directrunofffrac_rng = [0.01, 0.99]
+        self.meltrate_rng = [0.01, 0.99]
+        self.surplusrunofffact_rng = [0.01, 0.99]
+        # method output variables
+        self.soil_capacity = None
         self.snowfall = None
-        self.snow_stor = None
-        self.P_snow_melt = None
-        self.snowmelt = None
-        self.soil_m = None
-        self.PET = None
-        self.AET = None
         self.rain = None
         self.direct_runoff = None
-        self.surplus_runoff = None
-        self.total_runoff = None
+        self.snowmelt = None
+        self.pet = None
+        # model output
+        self.aet_result = None
+        self.soil_storage_result = None
+        self.snow_storage_result = None
+        self.snow_storage_result = None
+        self.snowmelt_result = None
+        self.surplus_runoff_result = None
+        self.total_runoff_result = None
+
+    @staticmethod
+    def _soil_capacity(sc):
+        return sc
+
+    def _snowfall(self, ts, tr):
+        # format ts and tr to 2d array
+        ts_arr = np.tile(ts, (len(self.times), 1)) * 1.0
+        tr_arr = np.tile(tr, (len(self.times), 1)) * 1.0
+        # index arrays for snow mixed and rain
+        s_ind = np.where(self.t <= ts_arr)
+        m_ind = np.where((self.t > ts_arr) & (self.t < tr))
+        r_ind = np.where(self.t >= tr_arr)
+        # calculate snowfall
+        ps = self.p * 1.0
+        ps[s_ind] = ps[s_ind]
+        ps[m_ind] = ps[m_ind] * ((tr_arr[m_ind] - self.t[m_ind]) / (tr_arr[m_ind] - ts_arr[m_ind]))
+        ps[r_ind] = 0.0
+        return ps
+
+    def _rain(self):
+        pr = self.p - self.snowfall
+        return pr
+
+    def _direct_runoff(self, drf):
+        dir_ro = drf * self.rain
+        return dir_ro
+
+    def _snowmelt(self, mr, ts):
+        # calculate snowmelt from degree days method
+        sm = mr * (self.t - ts) * np.transpose(np.tile(self.days_in_mnth, (len(self.latitude), 1)))
+        sm[sm < 0.0] = 0.0
+        return sm
 
     def _day_length(self):
         rad_lat = np.tile(np.radians(self.latitude), (len(self.times), 1))
         days = self.times - pd.Timedelta(15, unit='D')
         j = np.transpose(np.tile(days.dayofyear.values, (len(self.latitude), 1)))
-        decimal = 0.409*np.sin((2*np.pi/365)*j - 1.39)
-        sunset_ang = np.arccos(-np.tan(rad_lat)*np.tan(decimal))
-        day_len = (24/np.pi)*sunset_ang
+        decimal = 0.409 * np.sin((2 * np.pi / 365) * j - 1.39)
+        sunset_ang = np.arccos(-np.tan(rad_lat) * np.tan(decimal))
+        day_len = (24.0 / np.pi) * sunset_ang
         return day_len
 
-    def _snow_input(self, Tsnow, Train):
-        Tsnow_arr = np.tile(Tsnow, (len(self.times), 1))
-        Train_arr = np.tile(Train, (len(self.times), 1))
+    def _pet(self):
+        # did not use Gray and McGabe formula because what they present for
+        # water vapor density produces incorrect values (see Lu et al. 2005)
+        e_sat = 6.108 * np.exp((17.27 * self.t) / (self.t + 237.3))
+        rho_sat = 216.7 * (e_sat / (self.t + 273.3))
+        d = self._day_length()
+        k_pec = 1.0
+        pet = (0.1651 * (d / 12.0) * rho_sat * k_pec * np.transpose(np.tile(self.days_in_mnth, (len(self.latitude), 1))))
+        return pet
 
-        sno_ind = np.where(self.T <= Tsnow_arr)
-        mix_ind = np.where((self.T > Tsnow_arr) & (self.T < Train))
-        rain_ind = np.where(self.T >= Train_arr)
-        Psnow = self.P * 1.0  # Create 2D array and replace if T is greater than Tsnow
-        Psnow[sno_ind] = Psnow[sno_ind]
-        Psnow[mix_ind] = Psnow[mix_ind] * (
-                    (Train_arr[mix_ind] - self.T[mix_ind]) / (Train_arr[mix_ind] - Tsnow_arr[mix_ind]))
-        Psnow[rain_ind] = 0.0
-        return Psnow
-
-    def _rain(self):
-        ## Rain Fraction
-        Prain = self.P - self.snowfall
-        return Prain
-        
-    def _direct_runoff(self, drf):
-        ## Direct Runoff
-        Dir_RO = drf * self.rain    # Water Balance Runoff Variable
-        return Dir_RO
-        
-    def _snowmelt(self, alpha, Tsnow):
-        ## Snowmelt
-        Sno_M = alpha * (self.T - Tsnow) * np.transpose(np.tile(self.days_in_mnth, (len(self.latitude), 1)))
-        Sno_M[Sno_M < 0.0] = 0.0
-        return Sno_M
-
-    def _PET(self):
-        ## Potential Evapotranspiration
-        ## did not use Gray and McGabe formula because what they present for
-        ##  water vapor density produces incorrect values (see Lu et al. 2005)
-        e_sat = 6.108 * np.exp((17.27 * self.T) / (self.T + 237.3))
-        rho_sat = 216.7 * (e_sat / (self.T + 273.3))
-        D = self._day_length()
-        Kpec = 1.0
-        PET = (0.1651 * (D / 12) * rho_sat * Kpec * np.transpose(np.tile(self.days_in_mnth, (len(self.latitude), 1))))
-        return PET
-
-    def _soilmoisture_storage(self, dates, time_offset, Tsnow, Train, drf, alpha, rfactor):
-        self.snowfall = self._snow_input(Tsnow, Train)
+    def _soilmoisture_storage(self, dates, time_offset, slst_c, snow_t, rain_t, dir_f, mlt_r, srp_f):
+        # calculate method variables
+        self.soil_capacity = self._soil_capacity(sc=slst_c)
+        self.snowfall = self._snowfall(ts=snow_t, tr=rain_t)
         self.rain = self._rain()
-        self.direct_runoff = self._direct_runoff(drf)
-        self.P_snow_melt = self._snowmelt(alpha, Tsnow)
-        self.PET = self._PET()
+        self.direct_runoff = self._direct_runoff(drf=dir_f)
+        self.snowmelt = self._snowmelt(mr=mlt_r, ts=snow_t)
+        self.pet = self._pet()
 
-        smstor = []  # soil moisture storage
-        snowstor = []  # snow storage
-        surstor = []  # surplus storage
-        snwmlt = []  # snowmelt
-        AET_l = []  # AET list
-        surplus_r = []  # surplus runoff
+        # create soil snow and surplus storage lists
+        soil_stor = []
+        snow_stor = []
+        surp_stor = []
+        # create snowmelt aet and surplus runoff lists
+        snwmlt_list = []
+        aet_list = []
+        surpro_list = []
 
-        for i in tqdm(np.arange(time_offset, len(dates))):
+        # loop through time steps
+        for i in np.arange(time_offset, len(dates)):
             if i == time_offset:
-                STi_1 = self.STo
-                sno_stori_1 = self.snw_st_init
-                Suri_1 = self.Sur_init
+                soil_i1 = self.soil_st_init
+                snow_i1 = self.snow_st_init
+                surp_i1 = self.surp_st_init
             else:
                 if time_offset == 0:
-                    STi_1 = smstor[i - 1]
-                    sno_stori_1 = snowstor[i - 1]
-                    Suri_1 = surstor[i - 1]
-                elif time_offset == self.init_per:
-                    STi_1 = smstor[i - (self.init_per + 1)]
-                    sno_stori_1 = snowstor[i - (self.init_per + 1)]
-                    Suri_1 = surstor[i - (self.init_per + 1)]
+                    soil_i1 = soil_stor[i - 1]
+                    snow_i1 = snow_stor[i - 1]
+                    surp_i1 = surp_stor[i - 1]
+                elif time_offset == self.init_steps:
+                    soil_i1 = soil_stor[i - (self.init_steps + 1)]
+                    snow_i1 = snow_stor[i - (self.init_steps + 1)]
+                    surp_i1 = surp_stor[i - (self.init_steps + 1)]
                 else:
                     print(f"Error in warmup argument. Evaluate row {i}")
-            
-            # Liquid water input to Soil Moisture Storage
-            snow_storage = sno_stori_1 + self.snowfall[i, :] - self.P_snow_melt[i, :]
-            hi_snwm = np.where(snow_storage > 0.0)
-            lo_snwm = np.where(snow_storage <= 0.0)
 
-            snwm = self.P_snow_melt[i, :] * 1.0
-            snwm[hi_snwm] = self.P_snow_melt[i, :][hi_snwm]
-            snwm[lo_snwm] = sno_stori_1[lo_snwm] + self.snowfall[i, :][lo_snwm]
-            snow_storage[snow_storage < 0.0] = 0.0
+            # calculate snowmelt
+            snow_i = (snow_i1 + self.snowfall[i, :]) - self.snowmelt[i, :]
+            hi_snwm = np.where(snow_i > 0.0)
+            lo_snwm = np.where(snow_i <= 0.0)
+            snwm = self.snowmelt[i, :] * 1.0
+            snwm[hi_snwm] = self.snowmelt[i, :][hi_snwm]
+            snwm[lo_snwm] = snow_i1[lo_snwm] + self.snowfall[i, :][lo_snwm]
+            snow_i[snow_i < 0.0] = 0.0
 
-            # Ptotal calc
-            P_tot = (self.rain[i, :] - self.direct_runoff[i, :]) + snwm  # Premain is nested in this eq. Error in paper.
-            hi_pet = np.where(P_tot >= self.PET[i, :])
-            lo_pet = np.where(P_tot < self.PET[i, :])
+            # calculate p_tot and aet
+            # Premain is nested in this eq. Error in paper
+            p_tot = (self.rain[i, :] - self.direct_runoff[i, :]) + snwm
+            hi_pet = np.where(p_tot >= self.pet[i, :])
+            lo_pet = np.where(p_tot < self.pet[i, :])
 
-            # AET and ST calc
-            AET = self.PET[i, :] * 1.0
-            STi = STi_1 * 1.0
+            # calculate aet for hi_pet scenarios
+            aet = self.pet[i, :] * 1.0
+            soil_i = soil_i1 * 1.0
 
-            ## High AET
-            AET[hi_pet] = AET[hi_pet]
-            STi[hi_pet] = STi_1[hi_pet] + (P_tot[hi_pet] - AET[hi_pet])
-            ## Low AET
-            STi[lo_pet] = STi_1[lo_pet] - (abs(P_tot[lo_pet] - self.PET[i, :][lo_pet]) * (
-                        STi_1[lo_pet] / self.STC[lo_pet]))  # STi_1 starts as 0 so will always be 0 if P_tot is < PET
-            STi[STi < 0] = 0
-            STW = STi_1[lo_pet] - STi[lo_pet]
-            AET[lo_pet] = P_tot[lo_pet] + STW
+            # calculate soil storage for hi_pet scenarios
+            aet[hi_pet] = aet[hi_pet]
+            soil_i[hi_pet] = soil_i1[hi_pet] + (p_tot[hi_pet] - aet[hi_pet])
+            # calculate soil_i for lo_pet scenarios
+            soil_i[lo_pet] = soil_i1[lo_pet] - (abs(p_tot[lo_pet] - self.pet[i, :][lo_pet]) * (
+                        soil_i1[lo_pet] / self.soil_capacity[lo_pet]))
+            soil_i[soil_i < 0] = 0.0
 
-            # Surplus Runoff
-            Suri = np.repeat(0, len(self.locations))
-            hi_s = np.where(STi > self.STC)
-            Suri[hi_s] = STi[hi_s] - self.STC[hi_s]
-            Sur_RO = (Suri + Suri_1) * rfactor  # Calculate surplus runoff for month
-            Suri = Suri + Suri_1 - Sur_RO  # Calculate remaining runoff for month
+            # calculate surplus storage and surplus runoff
+            surp_i = surp_i1 * 1.0
+            hi_soil = np.where(soil_i > self.soil_capacity)
+            lo_soil = np.where(soil_i <= self.soil_capacity)
+            surp_i[hi_soil] = soil_i[hi_soil] - self.soil_capacity[hi_soil]
+            soil_i[hi_soil] = self.soil_capacity[hi_soil]
+            surp_i[lo_soil] = 0.0
+            surp_ro = (surp_i + surp_i1) * srp_f
+            surp_i = (surp_i + surp_i1) - surp_ro
 
-            smstor.append(STi)
-            surstor.append(Suri)
-            snowstor.append(snow_storage)
-            snwmlt.append(snwm)
-            AET_l.append(AET)
-            surplus_r.append(Sur_RO)
+            # calculate aet for lo_pet scenarios
+            soil_w = soil_i1[lo_pet] - soil_i[lo_pet]
+            aet[lo_pet] = p_tot[lo_pet] + soil_w
 
-        soil_storage = np.stack(smstor, axis=0)
-        surplus_storage = np.stack(surstor, axis=0)
-        snow_storage = np.stack(snowstor, axis=0)
-        snowmelt = np.stack(snwmlt, axis=0)
-        AET = np.stack(AET_l, axis=0)
-        surplus_runoff = np.stack(surplus_r, axis=0)
+            # append storage and results lists
+            soil_stor.append(soil_i)
+            snow_stor.append(snow_i)
+            surp_stor.append(surp_i)
+            snwmlt_list.append(snwm)
+            aet_list.append(aet)
+            surpro_list.append(surp_ro)
 
         res = xr.Dataset(
             {
-                "soil_storage": (['time', 'location'], soil_storage, {'standard_name': 'soil storage',
-                                                                      'units': 'mm'}),
-                "surplus_storage": (['time', 'location'], surplus_storage, {'standard_name': 'surplus storage',
-                                                                            'units': 'mm'}),
-                "snow_storage": (['time', 'location'], snow_storage, {'standard_name': 'snow_storage',
-                                                                      'units': 'mm'}),
-                "snowmelt": (['time', 'location'], snowmelt, {'standard_name': 'snowmelt',
-                                                              'units': 'mm'}),
-                "AET": (['time', 'location'], AET, {'standard_name': 'AET',
-                                                    'units': 'mm'}),
-                "surplus_runoff": (['time', 'location'], surplus_runoff, {'standard_name': 'surplus_runoff',
-                                                                          'units': 'mm'})
-
+                "soil_storage": (
+                    ['time', 'location'], np.stack(soil_stor, axis=0),
+                    {'standard_name': 'soil storage', 'units': 'mm'}),
+                "surplus_storage": (
+                    ['time', 'location'], np.stack(surp_stor, axis=0),
+                    {'standard_name': 'surplus storage', 'units': 'mm'}),
+                "snow_storage": (
+                    ['time', 'location'], np.stack(snow_stor, axis=0),
+                    {'standard_name': 'snow_storage', 'units': 'mm'}),
+                "snowmelt": (
+                    ['time', 'location'], np.stack(snwmlt_list, axis=0), {'standard_name': 'snowmelt', 'units': 'mm'}),
+                "AET": (['time', 'location'], np.stack(aet_list, axis=0), {'standard_name': 'AET', 'units': 'mm'}),
+                "surplus_runoff": (
+                    ['time', 'location'], np.stack(surpro_list, axis=0),
+                    {'standard_name': 'surplus_runoff', 'units': 'mm'})
             },
             coords={
-                "location": (['location'], self.locations, {'long_name': 'location_identifier',
-                                                                         'cf_role': 'timeseries_id'}),
-                # Keep the order of xds
+                "location": (
+                    ['location'], self.locations, {'long_name': 'location_identifier', 'cf_role': 'timeseries_id'}),
                 "time": self.times[time_offset:len(dates)]
             },
             attrs={
                 "featureType": 'timeSeries',
             }
         )
-
         return res
 
-    def _model_warmup(self, dates, time_offset, Tsnow, Train, drf, alpha, rfactor):
-        RES = self._soilmoisture_storage(dates, time_offset, Tsnow, Train, drf, alpha, rfactor)
-        return RES['soil_storage'].values[-1,:], RES['snow_storage'].values[-1,:], RES['surplus_storage'].values[-1,:]
-        
-    def run_model(self, Tsnow=None, Train=None, drf=None, alpha=None, rfactor=None):
-        kwargs = dict(Tsnow=Tsnow,
-                      Train=Train,
-                      drf=drf,
-                      alpha=alpha,
-                      rfactor=rfactor)
-        
-        selfkwargs = dict(Tsnow=self.snotemp,
-                          Train=self.raintemp,
-                          drf=self.DRF,
-                          alpha=self.melt_coef,
-                          rfactor=self.SRF)
-        
+    def _model_warmup(self, dates, time_offset, slst_c, snow_t, rain_t, dir_f, mlt_r, srp_f):
+        res = self._soilmoisture_storage(dates, time_offset, slst_c, snow_t, rain_t, dir_f, mlt_r, srp_f)
+        return res['soil_storage'].values[-1, :], res['snow_storage'].values[-1, :], res['surplus_storage'].values[-1,
+                                                                                     :]
+
+    def run_model(self, slst_c=None, snow_t=None, rain_t=None, dir_f=None, mlt_r=None, srp_f=None) -> xr.Dataset:
+        """
+        run the monthly water balance model
+        :return: xr.Dataset - water balance members
+        """
+        kwargs = dict(slst_c=slst_c, snow_t=snow_t, rain_t=rain_t, dir_f=dir_f, mlt_r=mlt_r, srp_f=srp_f)
+        self_kwargs = dict(slst_c=self.soilstoragecap, snow_t=self.snowtemp, rain_t=self.raintemp,
+                           dir_f=self.directrunofffrac, mlt_r=self.meltrate, srp_f=self.surplusrunofffact)
+
         for key in kwargs:
-            if kwargs[key] == None:
-                kwargs[key] = selfkwargs[key]
-                 
-        warmup_dates = self.times[0:self.init_per]
+            if kwargs[key] is None:
+                kwargs[key] = self_kwargs[key]
+        # warm up and model arguments
+        warmup_dates = self.times[0: self.init_steps]
+        w_args = [warmup_dates, 0, kwargs['slst_c'], kwargs['snow_t'], kwargs['rain_t'], kwargs['dir_f'],
+                  kwargs['mlt_r'], kwargs['srp_f']]
+        args = [self.times, self.init_steps, kwargs['slst_c'], kwargs['snow_t'], kwargs['rain_t'], kwargs['dir_f'],
+                kwargs['mlt_r'], kwargs['srp_f']]
 
-        w_args = [warmup_dates, 0, kwargs['Tsnow'], kwargs['Train'], kwargs['drf'], kwargs['alpha'], kwargs['rfactor']]
-        args = [self.times, self.init_per, kwargs['Tsnow'], kwargs['Train'], kwargs['drf'], kwargs['alpha'], kwargs['rfactor']]
+        # run warm up to calculate soil snow and surplus storage starting values
+        self.soil_st_init, self.snow_st_init, self.surp_st_init = self._model_warmup(*w_args)
 
-        # model warm up
-        print("Initializing Model")
-        self.STo, self.snw_st_init, self.Sur_init = self._model_warmup(*w_args)
         # model run
-        print("Running Model")
         result = self._soilmoisture_storage(*args)
-        # assign final arrays
-        self.AET = result['AET'].values
-        self.soil_m = result['soil_storage'].values
-        self.surplus_runoff = result['surplus_runoff'].values
-        self.snow_stor = result['snow_storage'].values
-        self.snowmelt = result['snowmelt'].values
-        # compute total runoff
-        Tot_RO = self.surplus_runoff + self.direct_runoff[self.init_per:len(self.times)]
-        self.total_runoff = Tot_RO
-        Tot_RO_arr = xr.DataArray(Tot_RO, coords=result.coords, attrs={'standard_name': 'Total Runoff', 'units': 'mm'})
-        Tot_RO_arr.name = 'total_runoff'
+        self.aet_result = result['AET'].values
+        self.soil_storage_result = result['soil_storage'].values
+        self.surplus_runoff_result = result['surplus_runoff'].values
+        self.snow_storage_result = result['snow_storage'].values
+        self.snowmelt_result = result['snowmelt'].values
 
-        p = self.P[self.init_per:len(self.times)]
+        # calculate total runoff from results
+        ro_tot = self.surplus_runoff_result + self.direct_runoff[self.init_steps: len(self.times)]
+        self.total_runoff_result = ro_tot
+        ro_tot_arr = xr.DataArray(ro_tot, coords=result.coords, attrs={'standard_name': 'Total Runoff', 'units': 'mm'})
+        ro_tot_arr.name = 'total_runoff'
+
+        p = self.p[self.init_steps: len(self.times)]
         p_arr = xr.DataArray(p, coords=result.coords, attrs={'standard_name': 'Precipitation', 'units': 'mm'})
         p_arr.name = 'precipitation'
-        result_xds = xr.merge([result, Tot_RO_arr, p_arr])
+        result_xds = xr.merge([result, ro_tot_arr, p_arr])
 
         return result_xds
