@@ -20,5 +20,5 @@ GRIDMET_XRES = 0.041666666666666664
 GRIDMET_YRES = 0.04166666666666668
 
 [DLEM]
-INPUT_VARS = ['mo_precip','mo_temp', 'mo_discharge']
-DSET_COORDS = ['location', 'lat', 'time']
+INPUT_VARS = ['mo_precip','mo_temp', 'mo_dischg']
+DSET_COORDS = ['location', 'time', 'lat']
