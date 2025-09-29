@@ -5,12 +5,15 @@ import py3dep
 from tqdm import tqdm
 import pandas as pd
 import xarray as xr
+import numpy as np
 from shapely.geometry import Point
 from prep.utils import get_gridmet_cells
 from config import GRIDMET_PARAMS
 import GRIDtools as gt
 
 from geocube.api.core import make_geocube
+from functools import partial
+from geocube.rasterize import rasterize_image
 
 import rioxarray
 import xvec
@@ -163,15 +166,17 @@ def get_gridmet_at_points(in_geom,
 
     return xds
 
-def get_gridmet_for_polygons_with_xvec(in_geom,
-                          gdf_index_col,
-                          start = DEFAULT_DATES[0],
-                          end = DEFAULT_DATES[1],
-                          crs = 4326) -> xr.Dataset:
+
+# TODO Bugs with gdf_index_col being imported as non-integer type. Fix when updating zonal stats
+def get_gridmet_for_polygons(in_geom,
+                             gdf_index_col,
+                             start = DEFAULT_DATES[0],
+                             end = DEFAULT_DATES[1],
+                             crs = 4326) -> xr.Dataset:
     """
     :return: Function takes a list of GridMET data parameters, start date, end date, and a Geopandas GeoDataFrame of
-    polygon geometries and returns a discrete station formatted xarray dataset of average or area weighted GridMET data to run mwb_flow
-    for each polygon geometry.
+    polygon geometries and returns a discrete station formatted xarray dataset of average or area weighted GridMET data
+    to run mwb_flow for each polygon geometry. Function uses exactextract methods.
     :param in_geom: geopandas.GeoDataFrame - contains geometry
     :param gdf_index_col: str - name of column in GeoDataFrame to use as a unique identifier for each geometry
     :param start: str "%Y-%m-%d" - Starting date of data extraction period
@@ -180,6 +185,11 @@ def get_gridmet_for_polygons_with_xvec(in_geom,
     :return: a xarray dataset for discrete locations (stations)
     """
 
+    # Set CRS of polygons for GridMet and exactextract
+    in_geom = in_geom.to_crs(crs)
+    in_geom_repro = in_geom.to_crs(5071)
+
+    # Pull GridMet data into a xarray
     gmet_list = []
     for p in GRIDMET_PARAMS:
         bnds = in_geom.total_bounds
@@ -187,21 +197,36 @@ def get_gridmet_for_polygons_with_xvec(in_geom,
                        bbox=BBox(bnds[0] - 0.5, bnds[2] + 0.5, bnds[3] + 0.5, bnds[1] - 0.5))
         gmet = gmet.subset_nc(return_array=True)
         gmet_input = gmet[list(gmet.data_vars)[0]]
+
+        # Change the CRS of xarray to 5071 for area calculations of zonal stats
+        gmet_input = gmet_input.rio.write_crs(input_crs=4326).to_dataset()
+        gmet_input = gmet_input.rio.reproject(5071)
+        gmet_input = gmet_input[list(gmet_input.data_vars)[0]]
+
+        # Calculate zonal stats according to parameters
         if p == 'pr':
-            vol_xds = gt.grid_area_weighted_volume(gmet_input, in_geom, gdf_index_col)
-            vol_xds = vol_xds.transpose('location', 'time').drop('area')
+            gmet_input = gmet_input / 1000  # convert from mm to meters
+            ds_sum = gmet_input.xvec.zonal_stats(geometry=in_geom_repro.geometry, x_coords="x", y_coords="y",
+                                                 stats="sum(coverage_weight=area_cartesian)", method="exactextract")
+            ds_sum.name = 'precipitation_amount'
         else:
             gmet_list.append(gmet_input)
-
     ds = xr.merge(gmet_list)
-    ds = ds.xvec.zonal_stats(geometry=in_geom.geometry, x_coords="lon", y_coords="lat", stats="mean", method="iterate")
+    ds = ds.xvec.zonal_stats(geometry=in_geom_repro.geometry, x_coords="x", y_coords="y",
+                             stats="mean(coverage_weight=none)", method="exactextract")
 
+    ds = xr.merge([ds, ds_sum])
+
+    # Add coords
     loc_df = pd.DataFrame(in_geom[gdf_index_col]).set_index(in_geom.geometry)
     loc_df = loc_df.reindex(in_geom.geometry.values)
 
     lat_df = pd.DataFrame((in_geom.geometry.bounds['miny'] + in_geom.geometry.bounds['maxy']) / 2).set_index(
         in_geom.geometry)
     lat_df = lat_df.reindex(in_geom.geometry.values)
+
+    area_df = pd.DataFrame(in_geom_repro.area / (1000 ** 2)).set_index(in_geom_repro.geometry) # convert to km^2
+    area_df = area_df.reindex(in_geom_repro.geometry.values)
 
     xds = xr.Dataset(
         {
@@ -210,13 +235,19 @@ def get_gridmet_for_polygons_with_xvec(in_geom,
                           'units': 'Kelvin'}),
             "min_temp": (['location', 'time'], ds['daily_minimum_temperature'].values,
                          {'standard_name': 'Maximum Temperature',
-                          'units': 'Kelvin'})
+                          'units': 'Kelvin'}),
+            "precip_volume": (['location', 'time'], ds['precipitation_amount'].values,
+                              {'standard_name': 'Precipitation Volume',
+                               'units': 'm^3'})
         },
         coords={
             "lat": (['location'], list(lat_df.iloc[:, 0]), {'standard_name': 'latitude',
                                                             'long_name': 'location_latitude',
                                                             'units': 'degrees',
                                                             'crs': '4326'}),
+            "area": (['location'], list(area_df.iloc[:, 0]), {'standard_name': 'area',
+                                                              'long_name': 'input_shape_area',
+                                                              'units': 'km^2'}),
             "location": (['location'], list(loc_df.iloc[:, 0]), {'long_name': 'location_identifier',
                                                                  'cf_role': 'timeseries_id'}),
             "time": ds['time'].values
@@ -225,16 +256,14 @@ def get_gridmet_for_polygons_with_xvec(in_geom,
             "featureType": 'timeSeries',
         }
     )
+    xds = xds.transpose('time', 'location')
 
-    if 'pr' in GRIDMET_PARAMS:
-        output = xr.merge([xds, vol_xds])
-    else:
-        output = xds
+    return xds
 
-    return output
+# Archive this function for future reference
 
-# TODO update get_gridmet_for_polygons to follow pydlem update
-def get_gridmet_for_polygons(in_geom,
+# TODO review and update code for GRIDtools update 2025-02-04
+def get_gridmet_for_polygons_with_geocube(in_geom,
                           gdf_index_col,
                           start = DEFAULT_DATES[0],
                           end = DEFAULT_DATES[1],
@@ -242,7 +271,7 @@ def get_gridmet_for_polygons(in_geom,
     """
     :return: Function takes a list of GridMET data parameters, start date, end date, and a Geopandas GeoDataFrame of
     polygon geometries and returns a discrete station formatted xarray dataset of average or area weighted GridMET data to run mwb_flow
-    for each polygon geometry.
+    for each polygon geometry. Function uses GRIDtools and Geocube methods.
     :param in_geom: geopandas.GeoDataFrame - contains geometry
     :param gdf_index_col: str - name of column in GeoDataFrame to use as a unique identifier for each geometry
     :param start: str "%Y-%m-%d" - Starting date of data extraction period
@@ -251,8 +280,11 @@ def get_gridmet_for_polygons(in_geom,
     :return: a xarray dataset for discrete locations (stations)
     """
 
+    in_geom = in_geom.astype({gdf_index_col: int})
+    all_polys = in_geom[gdf_index_col].tolist()
+
     var_list = []
-    for p in GRIDMET_PARAMS:
+    for p in tqdm(GRIDMET_PARAMS, desc='Parameters'):
         bnds = in_geom.total_bounds
         gmet = GridMet(variable=p, start=start, end=end,
                        bbox=BBox(bnds[0] - 0.5, bnds[2] + 0.5, bnds[3] + 0.5, bnds[1] - 0.5))
@@ -262,31 +294,42 @@ def get_gridmet_for_polygons(in_geom,
         if p == 'pr':
             gmet_input = gmet_input / 1000  # convert from mm to meters
             vol_xds = gt.grid_area_weighted_volume(gmet_input, in_geom, gdf_index_col)
-            # vol_xds = vol_xds.drop('area')
+
         else:
-            # This is done for each output of the above code
-            in_geom[gdf_index_col] = in_geom[gdf_index_col].astype(int)
-            gmet_input = gmet_input.rio.write_crs(input_crs=crs).rio.clip(
-                in_geom.geometry.values, in_geom.crs, all_touched=True)
-            gmet_input.name = p
+            in_polys = in_geom
+            poly_list = []
+            while all_polys != poly_list:
+                gmet_clipped = gmet_input.rio.write_crs(input_crs=crs).rio.clip(in_polys.geometry.values, in_polys.crs,
+                                                                                all_touched=True)
+                gmet_clipped.name = p
 
-            grid_out = make_geocube(vector_data=in_geom, measurements=[gdf_index_col], like=gmet_input).set_coords(gdf_index_col)
+                grid_out = make_geocube(vector_data=in_polys, measurements=[gdf_index_col], like=gmet_clipped,
+                                        rasterize_function=partial(rasterize_image, all_touched=True)).set_coords(
+                    gdf_index_col)
 
-            for date in range(0, len(gmet_input.time.values)):
-                gmet_ts = gmet_input[date, :, :]
-                grid_ts = grid_out
+                # make geodataframe to use for rerunning remaining polygons
+                batch = np.unique(
+                    grid_out.coords[gdf_index_col].values[~np.isnan(grid_out.coords[gdf_index_col].values)]).tolist()
+                poly_list.extend(batch)
+                poly_list = sorted(list(map(int, poly_list)), key=all_polys.index)
+                in_polys = in_geom[in_geom[gdf_index_col].isin(list(set(all_polys) - set(poly_list)))]
 
-                grid_ts[p] = (grid_out.dims, gmet_ts.values, gmet_ts.attrs, gmet_ts.encoding)
-                grid_ts = grid_out.drop("spatial_ref").groupby(grid_out[gdf_index_col]).mean()
+                for date in range(0, len(gmet_input.time.values)):
+                    gmet_ts = gmet_clipped[date, :, :]
+                    grid_ts = grid_out
 
-                xda = grid_ts[p]
-                xda = xda.expand_dims({"time": 1}).assign_coords(time=('time', [gmet_ts.time.values]))
-                var_list.append(xda)
+                    grid_ts[p] = (grid_out.dims, gmet_ts.values, gmet_ts.attrs, gmet_ts.encoding)
+                    grid_ts = grid_out.drop("spatial_ref").groupby(grid_out[gdf_index_col]).mean()
+                    xda = grid_ts[p]
+                    xda = xda.expand_dims({"time": 1}).assign_coords(time=('time', [gmet_ts.time.values]))
+                    var_list.append(xda)
+
         xds = xr.merge(var_list)
 
+    # Add Coords
     lat_df = pd.DataFrame((in_geom.geometry.bounds['miny'] + in_geom.geometry.bounds['maxy']) / 2).set_index(
         in_geom[gdf_index_col])
-    lat_df = lat_df.reindex(list(xds.gageID.values.astype(int)))
+    lat_df = lat_df.reindex(list(xds[gdf_index_col].values.astype(int)))
 
     xds = xr.Dataset(
         {
@@ -310,9 +353,26 @@ def get_gridmet_for_polygons(in_geom,
         }
     )
 
-    if 'pr' in GRIDMET_PARAMS:
-        output = xr.merge([xds, vol_xds])  # vol_xds reorders to match xds
-    else:
-        output = xds
+    output = xr.merge([xds, vol_xds])  # vol_xds reorders to match xds
 
     return output
+
+
+# import geopandas as gpd
+# import GRIDtools as gt
+# from shapely.geometry import Polygon, Point
+# pour_pnt = gpd.GeoDataFrame(
+#     {
+#         "name": ["Soda Butte"],
+#     },
+#     geometry=[Point(-110.0018722, 45.00283056)],
+#     crs=4326
+# )
+#
+# watershed_gdf = gt.delineate_watershed(pour_pnt)
+# watershed_gdf["catchmentID"] = '06187915'
+#
+# met_data = get_gridmet_for_polygons_with_geocube(in_geom=watershed_gdf, gdf_index_col="catchmentID",
+#                                     start='2024-12-25', end='2024-12-31')
+#
+# print(met_data)
